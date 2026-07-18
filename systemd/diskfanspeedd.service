@@ -1,0 +1,22 @@
+[Unit]
+Description=Disk-temperature-based fan speed controller
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/diskfanspeedd
+Restart=on-failure
+RestartSec=5
+StateDirectory=diskfanspeedd
+User=root
+
+# smartctl and the serial port both need root/raw device access; keep
+# the process otherwise unprivileged where possible.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/diskfanspeedd /run
+
+[Install]
+WantedBy=multi-user.target

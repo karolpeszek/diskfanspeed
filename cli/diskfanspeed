@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""
+diskfanspeed - control diskfanspeedd (disk-temp-based fan controller)
+
+Usage:
+  diskfanspeed status [-f|--follow [SECONDS]]
+                         show current mode, fan speed, and per-disk temps
+                         -f/--follow repeats every SECONDS (default 1),
+                         printing each update below the last, until
+                         interrupted with Ctrl-C
+  diskfanspeed auto     switch to automatic, temperature-based fan control
+  diskfanspeed full     force fans to full speed
+"""
+
+import configparser
+import json
+import socket
+import sys
+import time
+
+CONFIG_PATH = "/etc/diskfanspeed/diskfanspeedd.conf"
+DEFAULT_SOCKET = "/run/diskfanspeedd.sock"
+DEFAULT_FOLLOW_INTERVAL = 1.0
+
+COLOR_GREEN = "\033[32m"
+COLOR_YELLOW = "\033[33m"
+COLOR_RED = "\033[31m"
+COLOR_RESET = "\033[0m"
+CLEAR_LINE = "\033[K"
+
+
+def cursor_up(n):
+    return f"\033[{n}A"
+
+
+def get_config():
+    cp = configparser.ConfigParser()
+    cp.read(CONFIG_PATH)
+    return cp
+
+
+def get_socket_path(cp):
+    return cp.get("daemon", "socket_path", fallback=DEFAULT_SOCKET)
+
+
+def get_temp_thresholds(cp):
+    min_temp_c = cp.getfloat("fan_curve", "min_temp_c", fallback=30.0)
+    max_temp_c = cp.getfloat("fan_curve", "max_temp_c", fallback=45.0)
+    return min_temp_c, max_temp_c
+
+
+def send_command(sock_path, req):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(sock_path)
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            s.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except FileNotFoundError:
+        sys.stderr.write(f"error: control socket not found at {sock_path} "
+                          "(is diskfanspeedd running?)\n")
+        sys.exit(1)
+    except PermissionError:
+        sys.stderr.write(f"error: permission denied connecting to {sock_path} "
+                          "(try sudo, or join the socket group)\n")
+        sys.exit(1)
+    except ConnectionRefusedError:
+        sys.stderr.write(f"error: connection refused at {sock_path} "
+                          "(is diskfanspeedd running?)\n")
+        sys.exit(1)
+
+    try:
+        return json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError:
+        sys.stderr.write("error: malformed response from daemon\n")
+        sys.exit(1)
+
+
+def colorize_temp(temp, min_temp_c, max_temp_c, use_color):
+    text = f"{temp} C"
+    if not use_color:
+        return text
+    if temp < min_temp_c:
+        color = COLOR_GREEN
+    elif temp > max_temp_c:
+        color = COLOR_RED
+    else:
+        color = COLOR_YELLOW
+    return f"{color}{text}{COLOR_RESET}"
+
+
+def render_status(data, min_temp_c, max_temp_c, use_color=True):
+    max_temp = data["max_temp_c"]
+    max_temp_str = (
+        colorize_temp(max_temp, min_temp_c, max_temp_c, use_color)
+        if max_temp is not None
+        else "unknown"
+    )
+    lines = [
+        f"mode:         {data['mode']}",
+        f"fan speed:    {data['pwm_percent']}%",
+        f"max temp:     {max_temp_str}",
+        f"last update:  {data['last_update']}",
+        "disks:",
+    ]
+    for disk, info in sorted(data.get("disks", {}).items()):
+        temp = info.get("temp")
+        temp_str = (
+            colorize_temp(temp, min_temp_c, max_temp_c, use_color)
+            if temp is not None
+            else "unknown"
+        )
+        if info.get("asleep"):
+            temp_str += " (asleep, last known)"
+        lines.append(f"  {disk}: {temp_str}")
+    return lines
+
+
+def print_status(data, min_temp_c, max_temp_c, use_color=True):
+    for line in render_status(data, min_temp_c, max_temp_c, use_color):
+        print(line)
+
+
+def parse_args(argv):
+    if not argv or argv[0] not in ("status", "auto", "full"):
+        sys.stderr.write(__doc__)
+        sys.exit(1)
+
+    action = argv[0]
+    follow = False
+    interval = DEFAULT_FOLLOW_INTERVAL
+
+    rest = argv[1:]
+    if rest:
+        if action != "status" or rest[0] not in ("-f", "--follow"):
+            sys.stderr.write(__doc__)
+            sys.exit(1)
+        follow = True
+        rest = rest[1:]
+        if rest:
+            try:
+                interval = float(rest[0])
+            except ValueError:
+                sys.stderr.write(__doc__)
+                sys.exit(1)
+            rest = rest[1:]
+        if rest:
+            sys.stderr.write(__doc__)
+            sys.exit(1)
+
+    return action, follow, interval
+
+
+def main():
+    action, follow, interval = parse_args(sys.argv[1:])
+
+    cp = get_config()
+    sock_path = get_socket_path(cp)
+    min_temp_c, max_temp_c = get_temp_thresholds(cp)
+    use_color = sys.stdout.isatty()
+
+    if action != "status":
+        resp = send_command(sock_path, {"cmd": "set_mode", "mode": action})
+        if not resp.get("ok"):
+            sys.stderr.write(f"error: {resp.get('error', 'unknown error')}\n")
+            sys.exit(1)
+        print(f"mode set to {action}; current fan speed: {resp['data']['pwm_percent']}%")
+        return
+
+    if not follow:
+        resp = send_command(sock_path, {"cmd": "status"})
+        if not resp.get("ok"):
+            sys.stderr.write(f"error: {resp.get('error', 'unknown error')}\n")
+            sys.exit(1)
+        print_status(resp["data"], min_temp_c, max_temp_c, use_color)
+        return
+
+    redraw = sys.stdout.isatty()
+    prev_line_count = 0
+    try:
+        while True:
+            resp = send_command(sock_path, {"cmd": "status"})
+            if not resp.get("ok"):
+                sys.stderr.write(f"error: {resp.get('error', 'unknown error')}\n")
+                sys.exit(1)
+            lines = render_status(resp["data"], min_temp_c, max_temp_c, use_color)
+            if redraw and prev_line_count:
+                sys.stdout.write(cursor_up(prev_line_count))
+            for line in lines:
+                sys.stdout.write(line + (CLEAR_LINE if redraw else "") + "\n")
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

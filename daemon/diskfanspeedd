@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+diskfanspeedd - monitors HDD temperatures in a USB enclosure and drives
+2x Noctua 5V PWM fans via an Arduino Uno on pin 9, over USB serial.
+
+Config: /etc/diskfanspeed/diskfanspeedd.conf
+Control socket: unix socket, JSON request/response, one per line.
+"""
+
+import configparser
+import grp
+import json
+import logging
+import os
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+try:
+    import serial
+except ImportError:
+    sys.stderr.write(
+        "pyserial is required (install with: apt install python3-serial)\n"
+    )
+    sys.exit(1)
+
+CONFIG_PATH = os.environ.get("DISKFANSPEEDD_CONFIG", "/etc/diskfanspeed/diskfanspeedd.conf")
+SMARTCTL = "smartctl"
+
+log = logging.getLogger("diskfanspeedd")
+
+
+class Config:
+    def __init__(self, path):
+        cp = configparser.ConfigParser()
+        if not cp.read(path):
+            raise SystemExit(f"could not read config file: {path}")
+
+        self.serial_port = cp.get("serial", "port", fallback="/dev/ttyACM0")
+        self.baud = cp.getint("serial", "baud", fallback=9600)
+
+        self.poll_interval = cp.getint("daemon", "poll_interval", fallback=30)
+        self.socket_path = cp.get("daemon", "socket_path", fallback="/run/diskfanspeedd.sock")
+        self.socket_group = cp.get("daemon", "socket_group", fallback=None)
+        self.state_file = cp.get("daemon", "state_file", fallback="/var/lib/diskfanspeedd/state.json")
+
+        self.min_temp_c = cp.getfloat("fan_curve", "min_temp_c", fallback=30.0)
+        self.max_temp_c = cp.getfloat("fan_curve", "max_temp_c", fallback=45.0)
+        self.min_pwm = cp.getint("fan_curve", "min_pwm", fallback=20)
+        self.max_pwm = cp.getint("fan_curve", "max_pwm", fallback=100)
+        self.full_pwm = cp.getint("fan_curve", "full_pwm", fallback=100)
+        self.idle_pwm = cp.getint("fan_curve", "idle_pwm", fallback=20)
+        self.idle_delay_s = cp.getint("fan_curve", "idle_delay_s", fallback=1800)
+
+        devices = cp.get("disks", "devices", fallback="")
+        self.disks = [d.strip() for d in devices.split(",") if d.strip()]
+        default_type = cp.get("disks", "smart_device_type", fallback="sat")
+
+        self.disk_types = {}
+        for disk in self.disks:
+            section = f"disk:{disk}"
+            if cp.has_section(section):
+                self.disk_types[disk] = cp.get(section, "smart_device_type", fallback=default_type)
+            else:
+                self.disk_types[disk] = default_type
+
+        if not self.disks:
+            raise SystemExit("no disks configured in [disks] section")
+
+
+def read_disk_temp(disk, dtype):
+    """Return (temp_c: float|None, asleep: bool). None temp + asleep=False means read error."""
+    cmd = [SMARTCTL, "-j", "-A", "-n", "standby", "-d", dtype, disk]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        log.warning("smartctl timed out on %s", disk)
+        return None, False
+    except FileNotFoundError:
+        log.error("smartctl not found on PATH")
+        return None, False
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        log.warning("smartctl gave no parseable output for %s: %s", disk, proc.stderr.strip())
+        return None, False
+
+    messages = " ".join(m.get("string", "") for m in data.get("smartctl", {}).get("messages", []))
+    if "STANDBY" in messages.upper() and "temperature" not in data:
+        return None, True  # asleep, skip this cycle
+
+    temp = data.get("temperature", {}).get("current")
+    if temp is not None:
+        return float(temp), False
+
+    for attr in data.get("ata_smart_attributes", {}).get("table", []):
+        if attr.get("id") in (194, 190):
+            raw = attr.get("raw", {})
+            if "value" in raw:
+                return float(raw["value"]), False
+
+    log.warning("could not find temperature for %s", disk)
+    return None, False
+
+
+def compute_pwm(max_temp, cfg):
+    if max_temp is None:
+        return cfg.idle_pwm
+    if max_temp <= cfg.min_temp_c:
+        pwm = cfg.min_pwm
+    elif max_temp >= cfg.max_temp_c:
+        pwm = cfg.max_pwm
+    else:
+        span = cfg.max_temp_c - cfg.min_temp_c
+        pwm = cfg.min_pwm + (cfg.max_pwm - cfg.min_pwm) * (max_temp - cfg.min_temp_c) / span
+    return max(0, min(100, round(pwm)))
+
+
+class FanDaemon:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state_lock = threading.Lock()
+        self.cycle_lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+        self.mode = "auto"
+        self.current_pwm = None
+        self.last_temps = {}   # disk -> {"temp": float|None, "asleep": bool, "ts": iso str}
+        self.last_max_temp = None
+        self.last_update = None
+        self.idle_since = None  # monotonic ts when all disks first went quiet, or None
+
+        self.ser = serial.Serial(cfg.serial_port, cfg.baud, timeout=2)
+        time.sleep(2)  # allow Arduino auto-reset on serial open to complete
+
+        self._load_state()
+
+    def _load_state(self):
+        try:
+            with open(self.cfg.state_file) as f:
+                saved = json.load(f)
+            self.last_temps = saved.get("last_temps", {})
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+
+    def _save_state(self):
+        try:
+            os.makedirs(os.path.dirname(self.cfg.state_file), exist_ok=True)
+            tmp = self.cfg.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"last_temps": self.last_temps}, f)
+            os.replace(tmp, self.cfg.state_file)
+        except OSError as e:
+            log.warning("could not persist state: %s", e)
+
+    def send_pwm(self, pwm):
+        line = f"{pwm}\n".encode("ascii")
+        self.ser.write(line)
+        self.ser.flush()
+        reply = self.ser.readline().decode("ascii", errors="replace").strip()
+        if not reply.startswith("OK"):
+            log.warning("unexpected reply from Arduino: %r", reply)
+
+    def do_cycle(self):
+        with self.cycle_lock:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            temps = {}
+            for disk in self.cfg.disks:
+                dtype = self.cfg.disk_types[disk]
+                temp, asleep = read_disk_temp(disk, dtype)
+                if temp is not None:
+                    temps[disk] = {"temp": temp, "asleep": False, "ts": now_iso}
+                elif asleep:
+                    prev = self.last_temps.get(disk, {})
+                    temps[disk] = {"temp": prev.get("temp"), "asleep": True, "ts": prev.get("ts")}
+                else:
+                    prev = self.last_temps.get(disk, {})
+                    temps[disk] = {"temp": prev.get("temp"), "asleep": prev.get("asleep", False), "ts": prev.get("ts")}
+
+            active_temps = [v["temp"] for v in temps.values() if v["temp"] is not None]
+            max_temp = max(active_temps) if active_temps else None
+
+            with self.state_lock:
+                mode = self.mode
+
+            if mode == "full":
+                pwm = self.cfg.full_pwm
+                self.idle_since = None
+            elif max_temp is not None:
+                pwm = compute_pwm(max_temp, self.cfg)
+                self.idle_since = None
+            else:
+                # every disk is asleep (or unreadable) this cycle. Hold the
+                # last fan speed for idle_delay_s before cutting to
+                # idle_pwm, so a disk that naps for a minute or two doesn't
+                # spin the fans down and back up.
+                now_mono = time.monotonic()
+                if self.idle_since is None:
+                    self.idle_since = now_mono
+                if now_mono - self.idle_since >= self.cfg.idle_delay_s:
+                    pwm = self.cfg.idle_pwm
+                else:
+                    pwm = self.current_pwm if self.current_pwm is not None else self.cfg.idle_pwm
+
+            self.send_pwm(pwm)
+
+            with self.state_lock:
+                self.last_temps = temps
+                self.last_max_temp = max_temp
+                self.current_pwm = pwm
+                self.last_update = now_iso
+
+            self._save_state()
+            log.info("mode=%s max_temp=%s pwm=%s%%", mode, max_temp, pwm)
+
+    def poll_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.do_cycle()
+            except Exception:
+                log.exception("error during poll cycle")
+            self.stop_event.wait(self.cfg.poll_interval)
+
+    def set_mode(self, mode):
+        if mode not in ("auto", "full"):
+            raise ValueError("mode must be 'auto' or 'full'")
+        with self.state_lock:
+            self.mode = mode
+        threading.Thread(target=self.do_cycle, daemon=True).start()
+
+    def status(self):
+        with self.state_lock:
+            return {
+                "mode": self.mode,
+                "pwm_percent": self.current_pwm,
+                "max_temp_c": self.last_max_temp,
+                "last_update": self.last_update,
+                "disks": self.last_temps,
+            }
+
+    def close(self):
+        self.stop_event.set()
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+class SocketHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        line = self.rfile.readline()
+        if not line:
+            return
+        try:
+            req = json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._respond({"ok": False, "error": "invalid JSON"})
+            return
+
+        cmd = req.get("cmd")
+        daemon = self.server.fan_daemon
+        try:
+            if cmd == "status":
+                self._respond({"ok": True, "data": daemon.status()})
+            elif cmd == "set_mode":
+                daemon.set_mode(req.get("mode"))
+                self._respond({"ok": True, "data": daemon.status()})
+            else:
+                self._respond({"ok": False, "error": f"unknown command: {cmd}"})
+        except Exception as e:
+            self._respond({"ok": False, "error": str(e)})
+
+    def _respond(self, obj):
+        self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+
+
+class ControlServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, socket_path, fan_daemon, socket_group=None):
+        self.fan_daemon = fan_daemon
+        if os.path.exists(socket_path):
+            os.remove(socket_path)
+        super().__init__(socket_path, SocketHandler)
+        os.chmod(socket_path, 0o660)
+        if socket_group:
+            try:
+                gid = grp.getgrnam(socket_group).gr_gid
+                os.chown(socket_path, -1, gid)
+            except KeyError:
+                log.warning("socket_group %r does not exist; skipping chown", socket_group)
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
+
+    cfg = Config(CONFIG_PATH)
+    fan_daemon = FanDaemon(cfg)
+
+    poll_thread = threading.Thread(target=fan_daemon.poll_loop, daemon=True)
+    poll_thread.start()
+
+    server = ControlServer(cfg.socket_path, fan_daemon, cfg.socket_group)
+
+    def shutdown(*_args):
+        log.info("shutting down")
+        # server.shutdown() blocks until serve_forever()'s loop (running on
+        # this same main thread) notices and exits - calling it directly
+        # from this signal handler would deadlock. Run it on another thread.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    import signal
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    log.info("diskfanspeedd started, monitoring %s", ", ".join(cfg.disks))
+    try:
+        server.serve_forever()
+    finally:
+        fan_daemon.close()
+
+
+if __name__ == "__main__":
+    main()
