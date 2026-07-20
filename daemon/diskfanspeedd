@@ -54,7 +54,7 @@ class Config:
         self.max_pwm = cp.getint("fan_curve", "max_pwm", fallback=100)
         self.full_pwm = cp.getint("fan_curve", "full_pwm", fallback=100)
         self.idle_pwm = cp.getint("fan_curve", "idle_pwm", fallback=20)
-        self.idle_delay_s = cp.getint("fan_curve", "idle_delay_s", fallback=1800)
+        self.idle_delay_s = cp.getint("fan_curve", "idle_delay_s", fallback=3600)
 
         devices = cp.get("disks", "devices", fallback="")
         self.disks = [d.strip() for d in devices.split(",") if d.strip()]
@@ -182,17 +182,37 @@ class FanDaemon:
                     prev = self.last_temps.get(disk, {})
                     temps[disk] = {"temp": prev.get("temp"), "asleep": prev.get("asleep", False), "ts": prev.get("ts")}
 
-            active_temps = [v["temp"] for v in temps.values() if v["temp"] is not None]
-            max_temp = max(active_temps) if active_temps else None
+            # max_temp (shown in status) may reflect a sleeping disk's last
+            # known reading. active_max_temp drives the fan curve and only
+            # counts disks that reported a fresh temp *this* cycle, so a
+            # disk that's gone to sleep stops influencing fan speed even
+            # though its last reading is still displayed.
+            all_temps = [v["temp"] for v in temps.values() if v["temp"] is not None]
+            max_temp = max(all_temps) if all_temps else None
+            awake_temps = [v["temp"] for v in temps.values() if v["temp"] is not None and not v["asleep"]]
+            active_max_temp = max(awake_temps) if awake_temps else None
+            all_asleep = bool(temps) and all(v["asleep"] for v in temps.values())
 
             with self.state_lock:
                 mode = self.mode
 
+            if mode == "off" and not all_asleep:
+                # A disk woke up while the fan was manually turned off - it's
+                # not safe to leave cooling off while a disk is active, so
+                # fall back to automatic control.
+                log.warning("disk activity detected while fan was off; reverting to auto mode")
+                mode = "auto"
+                with self.state_lock:
+                    self.mode = mode
+
             if mode == "full":
                 pwm = self.cfg.full_pwm
                 self.idle_since = None
-            elif max_temp is not None:
-                pwm = compute_pwm(max_temp, self.cfg)
+            elif mode == "off":
+                pwm = 0
+                self.idle_since = None
+            elif active_max_temp is not None:
+                pwm = compute_pwm(active_max_temp, self.cfg)
                 self.idle_since = None
             else:
                 # every disk is asleep (or unreadable) this cycle. Hold the
@@ -227,8 +247,16 @@ class FanDaemon:
             self.stop_event.wait(self.cfg.poll_interval)
 
     def set_mode(self, mode):
-        if mode not in ("auto", "full"):
-            raise ValueError("mode must be 'auto' or 'full'")
+        if mode not in ("auto", "full", "off"):
+            raise ValueError("mode must be 'auto', 'full', or 'off'")
+        if mode == "off":
+            with self.state_lock:
+                temps = self.last_temps
+            all_asleep = bool(temps) and all(
+                temps.get(disk, {}).get("asleep") for disk in self.cfg.disks
+            )
+            if not all_asleep:
+                raise ValueError("cannot turn off fan: not all disks are asleep")
         with self.state_lock:
             self.mode = mode
         threading.Thread(target=self.do_cycle, daemon=True).start()

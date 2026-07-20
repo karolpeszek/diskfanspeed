@@ -87,7 +87,13 @@ sudo systemctl enable --now diskfanspeedd
 diskfanspeed status   # mode, current fan %, max temp, per-disk temps
 diskfanspeed auto     # temperature-based control (default)
 diskfanspeed full     # force fans to 100%
+diskfanspeed off      # manually turn the fan off
 ```
+
+`off` is only accepted while every configured disk is currently asleep; the
+daemon rejects the command otherwise. If any disk wakes up while the fan is
+manually off, the daemon automatically reverts to `auto` mode so an active
+disk is never left without cooling.
 
 ## Notes
 
@@ -97,9 +103,11 @@ diskfanspeed full     # force fans to 100%
   before reading SMART data, so it won't wake a sleeping disk just to
   poll its temperature - it reuses the last known temperature for that
   disk instead. If every disk is asleep, the daemon holds the last fan
-  speed for `fan_curve.idle_delay_s` (default 30 minutes) before falling
-  back to `fan_curve.idle_pwm`, so a disk napping briefly doesn't spin
-  the fans down and back up.
+  speed for `fan_curve.idle_delay_s` (default 3600s = 1 hour) before
+  falling back to `fan_curve.idle_pwm` (fans off by default), so a disk
+  napping briefly doesn't spin the fans down and back up. The fan can
+  also be turned off manually with `diskfanspeed off` once every disk
+  is already asleep.
 - State (last known temps) persists to `state.json` under
   `/var/lib/diskfanspeedd` so a daemon restart doesn't momentarily forget
   a sleeping disk's last reading.
